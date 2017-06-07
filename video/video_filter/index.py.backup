@@ -1,0 +1,119 @@
+#! /usr/bin/env python
+# -*- coding: utf-8 -*-
+
+import multiprocessing
+from bottle import route,request,run
+import json
+import utility
+from pyhessian.client import HessianProxy
+import redis
+import time
+import random
+import os
+
+@route('/video/filter', methods=['GET', 'POST'])
+def index():
+    vid = request.query.vid.encode("utf-8")
+    vurl = request.query.vurl.encode("utf-8")
+    vtitle = request.query.vtitle.encode("utf-8")
+
+    if vid != '' and vurl != '':
+        if queue.qsize() == queue_size:
+            data = {'code': 400, 'msg': 'queue is full'}
+            return json.dumps(data)
+        else:
+            queue.put(vid + '&' + vurl + '&' + vtitle)
+            data = {'code': 200, 'msg': 'start process'}
+            return json.dumps(data)
+    else:
+        data = {'code': 400, 'msg': 'params error'}
+        return json.dumps(data)
+
+hessian_url = "http://ws.v.163.com/remote/videoinfo.do"
+sid = 'VBNKBLTOQ'  #netease video
+# sid = 'VBGV6CGV2'  #catch video
+num_process = 4
+queue_size = 10000
+log_dir = 'log'
+r0 = redis.Redis(host='localhost', port=6379, db=0)
+if not r0.exists('netease_video_index'):
+    r0.set('netease_video_index', 0)
+if not r0.exists('catch_video_index'):
+    r0.set('catch_video_index', 0)
+
+def getLibVideo():
+    service = HessianProxy(hessian_url)
+    time.sleep(random.uniform(0, 0.2))
+    if sid == 'VBNKBLTOQ':
+        index = r0.get('netease_video_index')
+        r0.incr('netease_video_index')
+    else:
+        index = r0.get('catch_video_index')
+        r0.incr('catch_video_index')
+    # p = r0.pipeline()
+    # index = p.get('index')
+    # p.incr('index')
+    # p.execute()
+    # videos = service.getAllVideo(0, int(index), 1)
+    videos = service.getAllVideoBySid(sid, 0, int(index), 1)
+    return videos[0]['vid'].encode('utf-8'), videos[0]['repovideourl'].encode('utf-8'), videos[0]['title'].encode('utf-8')
+
+def write_log(content):
+    today = time.strftime('%Y%m%d',time.localtime(time.time()))
+    log_filename = today + '.log'
+    log_path = os.path.join(log_dir, log_filename)
+    current = time.strftime('%Y-%m-%d %H:%M:%S',time.localtime(time.time()))
+    log = open(log_path, 'a')
+    log.write(content + '\t' + current + "\n")
+    log.close()
+
+class Classifier(multiprocessing.Process):
+    def __init__(self, queue):
+        multiprocessing.Process.__init__(self)
+        self.queue = queue
+
+    def run(self):
+        while True:
+            if not self.queue.empty():
+                task = self.queue.get(1)
+                vid = task.split('&')[0]
+                vurl = task.split('&')[1]
+                vtitle = task.split('&')[2]
+                try:
+                    result = utility.detect(vid, vurl, vtitle)
+                except ValueError:
+                    print("value error, misson canceled")
+                    continue
+                except:
+                    print("Some error occured")
+                    continue
+            else:
+                vid, vurl, vtitle = getLibVideo()
+                result = utility.detect(vid, vurl, vtitle)
+                if result['code'] == 200:
+                    if result['unique'] == 1:
+                        print("%s %s is unique" % (vid, vtitle))
+                        write_log('unique \t' + vid + '\t' + vtitle + '\t')
+                        print ''
+                    else:
+                        s_vid = result['similar_vid']
+                        s_vtitle = r0.get('title_' + s_vid)
+                        print("%s %s is similar to %s %s" % (vid, vtitle, s_vid, s_vtitle))
+                        write_log('similar \t' + vid + '\t' + vtitle + '\t' +  s_vid + '\t' + s_vtitle)
+                        print ''
+                else:
+                    print result['msg']
+                    print ''
+
+queue = multiprocessing.Queue(queue_size)
+processed = []
+for i in range(num_process):
+    processed.append(Classifier(queue))
+
+for i in range(len(processed)):
+    processed[i].start()
+
+run(host='0.0.0.0', port=8080)
+
+for i in range(len(processed)):
+   processed[i].join()
